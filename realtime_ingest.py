@@ -22,8 +22,15 @@ def generate_fake_kpi():
     total_seconds = int((now - start_date).total_seconds())
     random_seconds = random.randint(0, total_seconds)
     invoice_datetime = start_date + timedelta(seconds=random_seconds)
+    # Add random hour/minute/second for realism
+    invoice_datetime = invoice_datetime.replace(
+        hour=random.randint(0, 23),
+        minute=random.randint(0, 59),
+        second=random.randint(0, 59),
+        microsecond=0
+    )
     return {
-        "InvoiceDate": invoice_datetime,  # This now includes both date and time
+        "InvoiceDate": invoice_datetime,  # Includes date and exact sale time
         "Revenue": round(random.uniform(10000, 100000), 2),
         "Quantity": random.randint(1, 50),
         "CustomerID": random.randint(10000, 99999)
