@@ -7,29 +7,30 @@ from tensorflow.keras.layers import LSTM, Dense
 
 def linear_regression_forecast(df, date_column, value_column, n_periods, freq="D"):
     """
-    Forecast for daily (hourly), weekly, or monthly.
-    - For daily/hourly: X = [0, 1, ..., n-1] (sequential for time steps)
-    - For weekly/monthly: use ordinals
+    Forecast for hourly/daily/weekly/monthly periods.
+    - For hourly: X = [0, 1, ..., n-1]
+    - For daily/weekly/monthly: use date ordinals
     """
-    df = df.copy().sort_values(date_column)
+    df = df.copy()
     df = df[[date_column, value_column]].dropna()
-    df = df.reset_index(drop=True)
+    df[date_column] = pd.to_datetime(df[date_column])
+    df = df.sort_values(date_column).reset_index(drop=True)
+
+    if len(df) < 2:
+        return []
 
     if freq == "H":
-        # hourly: X = [0, 1, ..., n-1]
+        # Predict next n hours, sequentially
         X = np.arange(len(df)).reshape(-1, 1)
         y = df[value_column].values
         model = LinearRegression().fit(X, y)
         future_X = np.arange(len(df), len(df) + n_periods).reshape(-1, 1)
         preds = model.predict(future_X)
-        # Attach future hours
-        last_date = df[date_column].iloc[-1]
-        future_times = [last_date + pd.Timedelta(hours=i+1) for i in range(n_periods)]
+        last_time = df[date_column].iloc[-1]
+        future_times = [last_time + pd.Timedelta(hours=i+1) for i in range(n_periods)]
         return [(future_times[i], float(preds[i])) for i in range(n_periods)]
     else:
-        # weekly/monthly: use ordinals
-        df[date_column] = pd.to_datetime(df[date_column])
-        df = df.sort_values(date_column)
+        # For D/W/M: use date ordinal for X
         df['DateOrdinal'] = df[date_column].map(pd.Timestamp.toordinal)
         X = df[['DateOrdinal']]
         y = df[value_column]
@@ -62,11 +63,21 @@ def prepare_lstm_data(series, n_steps):
     return np.array(X), np.array(y), scaler
 
 def lstm_forecast(df, value_column, n_forecast=7, n_steps=14, freq="D"):
-    df = df.copy().sort_index()
-    series = df[value_column].values if isinstance(df, pd.DataFrame) else df.values
-    if len(series) < n_steps + 1:
+    df = df.copy()
+    # Use index as time if possible
+    if isinstance(df.index, pd.DatetimeIndex):
+        series = df[value_column].values
+        time_index = df.index
+    else:
+        series = df[value_column].values
+        time_index = pd.to_datetime(df.iloc[:, 0])
+
+    # Adjust n_steps for short series
+    effective_n_steps = min(n_steps, max(1, len(series)//2))
+    if len(series) < effective_n_steps + 1:
         return []
-    X, y, scaler = prepare_lstm_data(series, n_steps)
+
+    X, y, scaler = prepare_lstm_data(series, effective_n_steps)
     if X is None or len(X) == 0:
         return []
     model = Sequential([
@@ -82,17 +93,15 @@ def lstm_forecast(df, value_column, n_forecast=7, n_steps=14, freq="D"):
         forecast.append(pred[0,0])
         curr_seq = np.vstack([curr_seq[1:], pred])
     forecast_values = scaler.inverse_transform(np.array(forecast).reshape(-1,1)).flatten()
+
     # Get correct date index
+    last_date = time_index[-1]
     if freq == "H":
-        last_date = df.index[-1]
         dates = [last_date + pd.Timedelta(hours=i+1) for i in range(n_forecast)]
     elif freq == "W":
-        last_date = df.index[-1]
         dates = [last_date + pd.Timedelta(weeks=i+1) for i in range(n_forecast)]
     elif freq == "M":
-        last_date = df.index[-1]
         dates = [(last_date + pd.DateOffset(months=i+1)).replace(day=1) for i in range(n_forecast)]
     else:
-        last_date = df.index[-1]
         dates = [last_date + pd.Timedelta(days=i+1) for i in range(n_forecast)]
     return [(dates[i], float(forecast_values[i])) for i in range(n_forecast)]
