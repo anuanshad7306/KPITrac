@@ -278,18 +278,19 @@ def linear_regression_forecast(df, x_col, y_col, n_periods, freq="D"):
     df = df.copy().sort_values(x_col)
     df = df[[x_col, y_col]].dropna()
     df = df.reset_index(drop=True)
+    results = []
     if freq == "H":
-        # hourly: X = hour
-        if len(df) < 2: return []
+        if len(df) < 2:
+            return []
         X = df[x_col].values.reshape(-1, 1)
         y = df[y_col].values
         model = LinearRegression().fit(X, y)
         future_X = np.arange(df[x_col].max() + 1, df[x_col].max() + 1 + n_periods).reshape(-1, 1)
         preds = model.predict(future_X)
+        preds = np.maximum(preds, 0)  # Prevent negative predictions
         future_hours = future_X.flatten()
         return [(int(future_hours[i]), float(preds[i])) for i in range(n_periods)]
     else:
-        # Date-based: X = ordinal of date
         df[x_col] = pd.to_datetime(df[x_col])
         df = df.sort_values(x_col)
         df['DateOrdinal'] = df[x_col].map(pd.Timestamp.toordinal)
@@ -297,7 +298,6 @@ def linear_regression_forecast(df, x_col, y_col, n_periods, freq="D"):
         y = df[y_col]
         model = LinearRegression().fit(X, y)
         last_date = df[x_col].max()
-        preds = []
         for i in range(1, n_periods + 1):
             if freq == "D":
                 next_date = last_date + pd.Timedelta(days=i)
@@ -308,8 +308,9 @@ def linear_regression_forecast(df, x_col, y_col, n_periods, freq="D"):
             else:
                 next_date = last_date + pd.Timedelta(days=i)
             pred = model.predict([[next_date.toordinal()]])[0]
-            preds.append((next_date, float(pred)))
-        return preds
+            pred = max(pred, 0)  # Prevent negative predictions
+            results.append((next_date, float(pred)))
+        return results
 
 def prepare_lstm_data(series, n_steps):
     scaler = MinMaxScaler()
@@ -330,7 +331,6 @@ def lstm_forecast(df, value_column, n_forecast=7, n_steps=14, freq="D", x_col=No
     """
     # Use only the value column for sequence prediction
     if freq == "H":
-        # For hourly: use y as series sorted by hour
         df = df.copy().sort_values(x_col)
         series = df[value_column].values
         if len(series) < n_steps + 1:
@@ -351,12 +351,11 @@ def lstm_forecast(df, value_column, n_forecast=7, n_steps=14, freq="D", x_col=No
             forecast.append(pred[0, 0])
             curr_seq = np.vstack([curr_seq[1:], pred])
         forecast_values = scaler.inverse_transform(np.array(forecast).reshape(-1, 1)).flatten()
-        # Predict the hours following the last hour
+        forecast_values = np.maximum(forecast_values, 0)  # Prevent negative predictions
         last_hour = df[x_col].max()
         pred_hours = [int(last_hour + i + 1) for i in range(n_forecast)]
         return [(pred_hours[i], float(forecast_values[i])) for i in range(n_forecast)]
     else:
-        # For daily/weekly/monthly: use y as series sorted by date
         df = df.copy().sort_values(x_col if x_col else "InvoiceDate")
         series = df[value_column].values
         if len(series) < n_steps + 1:
@@ -377,6 +376,7 @@ def lstm_forecast(df, value_column, n_forecast=7, n_steps=14, freq="D", x_col=No
             forecast.append(pred[0, 0])
             curr_seq = np.vstack([curr_seq[1:], pred])
         forecast_values = scaler.inverse_transform(np.array(forecast).reshape(-1, 1)).flatten()
+        forecast_values = np.maximum(forecast_values, 0)  # Prevent negative predictions
         last_date = df[x_col if x_col else 'InvoiceDate'].max()
         preds = []
         for i, val in enumerate(forecast_values):
@@ -642,39 +642,76 @@ def dashboard_page(admin=False):
     forecast_type = st.radio("Forecast Method", ["Linear Regression", "LSTM"], horizontal=True, key="forecast_type_"+period)
     forecast_freq = st.radio("Forecast Frequency", ["Daily", "Weekly", "Monthly"], horizontal=True, key="forecast_freq_"+period)
     freq_for_pred = {"Daily": "D", "Weekly": "W", "Monthly": "M"}[forecast_freq]
-    n_days = st.number_input("Periods Ahead to Forecast", min_value=1, max_value=30, value=7, key="forecast_days_"+period)
+    n_periods = st.number_input("Periods Ahead to Forecast", min_value=1, max_value=30, value=7, key="forecast_days_"+period)
     if st.button("Generate Forecast", key="forecast_btn_"+period):
         preds = []
-        if period == "Daily" and not df_hourly.empty:
-            # Prediction on hourly data for the selected day
-            forecast_df = hourly_revenue.copy()
-            forecast_df = forecast_df.sort_values('Hour')
+        if period == "Daily" and not df_hourly.empty and forecast_freq == "Daily":
+            # Correction: If forecast frequency is Daily, do day-wise forecast
+            base_df = df[(df['InvoiceDate'].dt.date <= selected_date)].copy()
+            if base_df.empty:
+                st.warning("Not enough data for forecasting.")
+                return
+            base_df = base_df.set_index('InvoiceDate').resample('D').agg({
+                'Revenue': 'sum'
+            }).reset_index()
             if forecast_type == "Linear Regression":
-                preds = linear_regression_forecast(forecast_df, "Hour", "Revenue", int(n_days), freq="H")
-                pred_df = pd.DataFrame(preds, columns=["Hour", "Predicted Revenue"])
-                xaxis_label = "Hour"
+                preds = linear_regression_forecast(base_df, "InvoiceDate", "Revenue", int(n_periods), freq="D")
+                pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
+                xaxis_label = "Date"
             else:
-                preds = lstm_forecast(forecast_df, "Revenue", n_forecast=int(n_days), n_steps=min(7, len(forecast_df)-1), freq="H", x_col="Hour")
-                pred_df = pd.DataFrame(preds, columns=["Hour", "Predicted Revenue"])
-                xaxis_label = "Hour"
-            st.write(f"**Forecast (Hourly for {selected_date}):**")
+                preds = lstm_forecast(base_df, "Revenue", n_forecast=int(n_periods), n_steps=min(7, len(base_df)-1), freq="D", x_col="InvoiceDate")
+                pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
+                xaxis_label = "Date"
+            st.write(f"**Forecast (Day-wise for next {n_periods} days):**")
+        elif period == "Daily" and not df_hourly.empty and forecast_freq == "Weekly":
+            # Weekly forecast for selected day context
+            base_df = df[(df['InvoiceDate'].dt.date <= selected_date)].copy()
+            if base_df.empty:
+                st.warning("Not enough data for forecasting.")
+                return
+            base_df = base_df.set_index('InvoiceDate').resample('W').agg({
+                'Revenue': 'sum'
+            }).reset_index()
+            if forecast_type == "Linear Regression":
+                preds = linear_regression_forecast(base_df, "InvoiceDate", "Revenue", int(n_periods), freq="W")
+                pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
+                xaxis_label = "Date"
+            else:
+                preds = lstm_forecast(base_df, "Revenue", n_forecast=int(n_periods), n_steps=min(7, len(base_df)-1), freq="W", x_col="InvoiceDate")
+                pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
+                xaxis_label = "Date"
+            st.write(f"**Forecast (Week-wise for next {n_periods} weeks):**")
+        elif period == "Daily" and not df_hourly.empty and forecast_freq == "Monthly":
+            # Monthly forecast for selected day context
+            base_df = df[(df['InvoiceDate'].dt.date <= selected_date)].copy()
+            if base_df.empty:
+                st.warning("Not enough data for forecasting.")
+                return
+            base_df = base_df.set_index('InvoiceDate').resample('M').agg({
+                'Revenue': 'sum'
+            }).reset_index()
+            if forecast_type == "Linear Regression":
+                preds = linear_regression_forecast(base_df, "InvoiceDate", "Revenue", int(n_periods), freq="M")
+                pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
+                xaxis_label = "Date"
+            else:
+                preds = lstm_forecast(base_df, "Revenue", n_forecast=int(n_periods), n_steps=min(7, len(base_df)-1), freq="M", x_col="InvoiceDate")
+                pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
+                xaxis_label = "Date"
+            st.write(f"**Forecast (Month-wise for next {n_periods} months):**")
         else:
-            # Prediction for Weekly, Monthly, Yearly, or Daily (future days)
-            if period == "Daily":
-                base_df = df[df['InvoiceDate'].dt.date == selected_date] if not df.empty else pd.DataFrame()
-                base_df = df_res if base_df.empty else base_df
-            else:
-                base_df = df_res
+            # For Weekly, Monthly, Yearly, or Daily (future days)
+            base_df = df_res
             if base_df.empty:
                 st.warning("Not enough data for forecasting.")
                 return
             base_df = base_df.copy().sort_values("InvoiceDate")
             if forecast_type == "Linear Regression":
-                preds = linear_regression_forecast(base_df, "InvoiceDate", "Revenue", int(n_days), freq=freq_for_pred)
+                preds = linear_regression_forecast(base_df, "InvoiceDate", "Revenue", int(n_periods), freq=freq_for_pred)
                 pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
                 xaxis_label = "Date"
             else:
-                preds = lstm_forecast(base_df, "Revenue", n_forecast=int(n_days), n_steps=min(7, len(base_df)-1), freq=freq_for_pred, x_col="InvoiceDate")
+                preds = lstm_forecast(base_df, "Revenue", n_forecast=int(n_periods), n_steps=min(7, len(base_df)-1), freq=freq_for_pred, x_col="InvoiceDate")
                 pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
                 xaxis_label = "Date"
             st.write(f"**Forecast ({forecast_freq}):**")
