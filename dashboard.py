@@ -7,14 +7,13 @@ import os
 import numpy as np
 from datetime import datetime, timedelta
 from sklearn.ensemble import IsolationForest
-from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
 import smtplib
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
 import random
+
+from forecasting import prophet_lstm_forecast
+from recommendations import get_recommendations
 
 # === Load environment variables ===
 load_dotenv()
@@ -218,7 +217,6 @@ def normalize_realtime_kpis():
     daily['AvgOrderValue'] = daily['AvgOrderValue'].replace([np.inf, -np.inf], 0).fillna(0)
     realtime_kpis_collection.delete_many({})
     realtime_kpis_collection.insert_many(daily.reset_index().to_dict('records'))
-    # For hourly analytics, store per-transaction data
     df['Hour'] = df['InvoiceDate'].dt.hour
     db['transactions_hourly_realtime'].delete_many({})
     db['transactions_hourly_realtime'].insert_many(df.to_dict('records'))
@@ -253,7 +251,6 @@ def fetch_hourly_transactions(selected_date, realtime=False):
     df['Hour'] = df['InvoiceDate'].dt.hour
     return df
 
-# === Anomaly Detection ===
 def detect_anomalies(df, revenue_column="Revenue"):
     df = df.copy()
     if df.empty or revenue_column not in df.columns:
@@ -267,129 +264,6 @@ def detect_anomalies(df, revenue_column="Revenue"):
     else:
         df['Anomaly'] = 0
     return df
-
-# ==== Forecasting ==== #
-def linear_regression_forecast(df, x_col, y_col, n_periods, freq="D"):
-    """
-    General-purpose linear regression forecast for daily/hourly/weekly/monthly.
-    - For hourly: X = hour (0-23)
-    - For daily/weekly/monthly: X = ordinal of date
-    """
-    df = df.copy().sort_values(x_col)
-    df = df[[x_col, y_col]].dropna()
-    df = df.reset_index(drop=True)
-    results = []
-    if freq == "H":
-        if len(df) < 2:
-            return []
-        X = df[x_col].values.reshape(-1, 1)
-        y = df[y_col].values
-        model = LinearRegression().fit(X, y)
-        future_X = np.arange(df[x_col].max() + 1, df[x_col].max() + 1 + n_periods).reshape(-1, 1)
-        preds = model.predict(future_X)
-        preds = np.maximum(preds, 0)  # Prevent negative predictions
-        future_hours = future_X.flatten()
-        return [(int(future_hours[i]), float(preds[i])) for i in range(n_periods)]
-    else:
-        df[x_col] = pd.to_datetime(df[x_col])
-        df = df.sort_values(x_col)
-        df['DateOrdinal'] = df[x_col].map(pd.Timestamp.toordinal)
-        X = df[['DateOrdinal']]
-        y = df[y_col]
-        model = LinearRegression().fit(X, y)
-        last_date = df[x_col].max()
-        for i in range(1, n_periods + 1):
-            if freq == "D":
-                next_date = last_date + pd.Timedelta(days=i)
-            elif freq == "W":
-                next_date = last_date + pd.Timedelta(weeks=i)
-            elif freq == "M":
-                next_date = (last_date + pd.DateOffset(months=i)).replace(day=1)
-            else:
-                next_date = last_date + pd.Timedelta(days=i)
-            pred = model.predict([[next_date.toordinal()]])[0]
-            pred = max(pred, 0)  # Prevent negative predictions
-            results.append((next_date, float(pred)))
-        return results
-
-def prepare_lstm_data(series, n_steps):
-    scaler = MinMaxScaler()
-    series = np.asarray(series).reshape(-1, 1)
-    scaled = scaler.fit_transform(series)
-    X, y = [], []
-    for i in range(len(scaled) - n_steps):
-        X.append(scaled[i:i + n_steps])
-        y.append(scaled[i + n_steps])
-    if not X:
-        return None, None, None
-    return np.array(X), np.array(y), scaler
-
-def lstm_forecast(df, value_column, n_forecast=7, n_steps=14, freq="D", x_col=None):
-    """
-    LSTM forecast for various time frequencies.
-    For hourly: X = hour, for other: X = date.
-    """
-    # Use only the value column for sequence prediction
-    if freq == "H":
-        df = df.copy().sort_values(x_col)
-        series = df[value_column].values
-        if len(series) < n_steps + 1:
-            return []
-        X, y, scaler = prepare_lstm_data(series, n_steps)
-        if X is None or len(X) == 0:
-            return []
-        model = Sequential([
-            LSTM(50, activation='relu', input_shape=(X.shape[1], X.shape[2])),
-            Dense(1)
-        ])
-        model.compile(optimizer='adam', loss='mse')
-        model.fit(X, y, epochs=100, verbose=0)
-        forecast = []
-        curr_seq = X[-1]
-        for _ in range(n_forecast):
-            pred = model.predict(curr_seq[np.newaxis, ...], verbose=0)
-            forecast.append(pred[0, 0])
-            curr_seq = np.vstack([curr_seq[1:], pred])
-        forecast_values = scaler.inverse_transform(np.array(forecast).reshape(-1, 1)).flatten()
-        forecast_values = np.maximum(forecast_values, 0)  # Prevent negative predictions
-        last_hour = df[x_col].max()
-        pred_hours = [int(last_hour + i + 1) for i in range(n_forecast)]
-        return [(pred_hours[i], float(forecast_values[i])) for i in range(n_forecast)]
-    else:
-        df = df.copy().sort_values(x_col if x_col else "InvoiceDate")
-        series = df[value_column].values
-        if len(series) < n_steps + 1:
-            return []
-        X, y, scaler = prepare_lstm_data(series, n_steps)
-        if X is None or len(X) == 0:
-            return []
-        model = Sequential([
-            LSTM(50, activation='relu', input_shape=(X.shape[1], X.shape[2])),
-            Dense(1)
-        ])
-        model.compile(optimizer='adam', loss='mse')
-        model.fit(X, y, epochs=100, verbose=0)
-        forecast = []
-        curr_seq = X[-1]
-        for _ in range(n_forecast):
-            pred = model.predict(curr_seq[np.newaxis, ...], verbose=0)
-            forecast.append(pred[0, 0])
-            curr_seq = np.vstack([curr_seq[1:], pred])
-        forecast_values = scaler.inverse_transform(np.array(forecast).reshape(-1, 1)).flatten()
-        forecast_values = np.maximum(forecast_values, 0)  # Prevent negative predictions
-        last_date = df[x_col if x_col else 'InvoiceDate'].max()
-        preds = []
-        for i, val in enumerate(forecast_values):
-            if freq == "D":
-                next_date = last_date + pd.Timedelta(days=i + 1)
-            elif freq == "W":
-                next_date = last_date + pd.Timedelta(weeks=i + 1)
-            elif freq == "M":
-                next_date = (last_date + pd.DateOffset(months=i + 1)).replace(day=1)
-            else:
-                next_date = last_date + pd.Timedelta(days=i + 1)
-            preds.append((next_date, float(val)))
-        return preds
 
 # === UI Styling ===
 st.markdown("""
@@ -411,7 +285,6 @@ html, body, [class*="css"]  {
 
 st.markdown('<div class="kpitrac-title">KPITrac</div>', unsafe_allow_html=True)
 
-# === Auth and Routing ===
 if 'page' not in st.session_state:
     st.session_state['page'] = 'login'
 
@@ -510,28 +383,69 @@ def analyst_panel():
 
 def dashboard_page(admin=False):
     st.subheader("Dashboard")
-    mode = st.radio("Select Data Source", ["Upload Dataset", "Real Time KPIs"])
+    # Show option to upload data or select real-time, but do NOT fetch any KPIs until user makes a choice
+    mode = st.radio("Select Data Source", ["Upload Dataset", "Real Time KPIs"], key="kpi_mode")
+    # Persistent session to know if data loaded
+    if 'kpi_data_loaded' not in st.session_state:
+        st.session_state['kpi_data_loaded'] = False
+        st.session_state['kpi_collection'] = None
+        st.session_state['hourly_collection_realtime'] = None
+
+    data_loaded = False
+    df = pd.DataFrame()
+    df_hourly = pd.DataFrame()
+    # Upload dataset
     if mode == "Upload Dataset":
         uploaded_file = st.file_uploader("Upload Excel File (.xlsx)", type=["xlsx"])
-        if uploaded_file:
+        if uploaded_file and st.button("Process File", key="process_file_btn"):
             preprocess_excel(uploaded_file)
             st.success("File processed and data saved.")
             st.cache_data.clear()
-            rerun()
-        kpi_collection = "daily_kpis"
-        hourly_collection_realtime = False
-        st.info("Showing KPIs from uploaded dataset.")
+            st.session_state['kpi_data_loaded'] = True
+            st.session_state['kpi_collection'] = "daily_kpis"
+            st.session_state['hourly_collection_realtime'] = False
+            st.rerun()
+        if st.session_state.get('kpi_data_loaded') and st.session_state.get('kpi_collection') == "daily_kpis":
+            kpi_collection = "daily_kpis"
+            hourly_collection_realtime = False
+            data_loaded = True
+            st.info("Showing KPIs from uploaded dataset.")
+        else:
+            # Show zeros before upload
+            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+            kpi1.metric("Total Revenue", "$0.00")
+            kpi2.metric("Total Orders", "0")
+            kpi3.metric("Total Customers", "0")
+            kpi4.metric("Avg Order Value", "$0.00")
+            st.info("No data loaded. Please upload a dataset and click 'Process File'.")
+            return
     else:
-        with st.spinner("Aggregating real-time KPIs..."):
-            normalize_realtime_kpis()
-            st.cache_data.clear()
-        kpi_collection = "realtime_kpis"
-        hourly_collection_realtime = True
-        st.info("Showing real-time KPIs (auto-updated by scheduled job).")
+        if st.button("Load Real Time KPIs", key="realtime_btn"):
+            with st.spinner("Aggregating real-time KPIs..."):
+                normalize_realtime_kpis()
+                st.cache_data.clear()
+            st.session_state['kpi_data_loaded'] = True
+            st.session_state['kpi_collection'] = "realtime_kpis"
+            st.session_state['hourly_collection_realtime'] = True
+            st.rerun()
+        if st.session_state.get('kpi_data_loaded') and st.session_state.get('kpi_collection') == "realtime_kpis":
+            kpi_collection = "realtime_kpis"
+            hourly_collection_realtime = True
+            data_loaded = True
+            st.info("Showing real-time KPIs (auto-updated by scheduled job).")
+        else:
+            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+            kpi1.metric("Total Revenue", "$0.00")
+            kpi2.metric("Total Orders", "0")
+            kpi3.metric("Total Customers", "0")
+            kpi4.metric("Avg Order Value", "$0.00")
+            st.info("No data loaded. Please click 'Load Real Time KPIs'.")
+            return
 
+    # KPIs actually loaded, now fetch and show
     df = fetch_kpis_data(kpi_collection)
     if df.empty:
-        st.info("No data available. Please upload a dataset or wait for real-time KPIs.")
+        st.info("No data available. Please upload a dataset or load real-time KPIs.")
         return
 
     period = st.selectbox("Select View Period", ["Daily", "Weekly", "Monthly", "Yearly"])
@@ -571,6 +485,12 @@ def dashboard_page(admin=False):
             fig.update_xaxes(title="Hour of Day (0-23)", tickmode='linear', tick0=0, dtick=1)
             fig.update_layout(xaxis=dict(range=[-0.5, 23.5]))
             st.plotly_chart(fig, use_container_width=True)
+            # Recommendations for hourly (use last 7 days' daily KPIs)
+            latest_days = df.tail(7)
+            recs = get_recommendations(latest_days, hourly_revenue)
+            st.markdown("#### Recommendations")
+            for rec in recs:
+                st.info(rec)
         else:
             st.info("No data for selected day.")
             return
@@ -636,91 +556,34 @@ def dashboard_page(admin=False):
                 name='Anomaly'
             )
         st.plotly_chart(fig, use_container_width=True)
+        # Recommendations
+        recs = get_recommendations(df_res, anomalies)
+        st.markdown("#### Recommendations")
+        for rec in recs:
+            st.info(rec)
 
-    # === Forecast Revenue feature: Add prediction frequency option ===
-    st.subheader("Forecast Revenue")
-    forecast_type = st.radio("Forecast Method", ["Linear Regression", "LSTM"], horizontal=True, key="forecast_type_"+period)
-    forecast_freq = st.radio("Forecast Frequency", ["Daily", "Weekly", "Monthly"], horizontal=True, key="forecast_freq_"+period)
-    freq_for_pred = {"Daily": "D", "Weekly": "W", "Monthly": "M"}[forecast_freq]
-    n_periods = st.number_input("Periods Ahead to Forecast", min_value=1, max_value=30, value=7, key="forecast_days_"+period)
-    if st.button("Generate Forecast", key="forecast_btn_"+period):
-        preds = []
-        if period == "Daily" and not df_hourly.empty and forecast_freq == "Daily":
-            # Correction: If forecast frequency is Daily, do day-wise forecast
-            base_df = df[(df['InvoiceDate'].dt.date <= selected_date)].copy()
-            if base_df.empty:
-                st.warning("Not enough data for forecasting.")
-                return
-            base_df = base_df.set_index('InvoiceDate').resample('D').agg({
-                'Revenue': 'sum'
-            }).reset_index()
-            if forecast_type == "Linear Regression":
-                preds = linear_regression_forecast(base_df, "InvoiceDate", "Revenue", int(n_periods), freq="D")
-                pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
-                xaxis_label = "Date"
+    # === Forecast Revenue: Prophet + LSTM Residuals (Admin Only, with button) ===
+    if admin:
+        st.subheader("Revenue Forecast (Prophet + LSTM Residuals)")
+        n_days = st.number_input("How many days to forecast (1-30)?", min_value=1, max_value=30, value=7, step=1)
+        predict_btn = st.button("Predict Revenue Forecast")
+        df_daily = df.set_index('InvoiceDate').resample('D').agg({'Revenue': 'sum'}).dropna().reset_index()
+        if predict_btn:
+            if len(df_daily) >= 30:
+                with st.spinner("Generating forecast using Prophet + LSTM..."):
+                    forecast_df = prophet_lstm_forecast(df_daily, "InvoiceDate", "Revenue", n_days=int(n_days))
+                    st.dataframe(forecast_df[["Date", "Final_Forecast"]].rename(columns={"Final_Forecast": "Forecasted Revenue"}), use_container_width=True)
+                    fig3 = px.line(forecast_df, x="Date", y="Final_Forecast", title=f"{int(n_days)}-Day Revenue Forecast", markers=True)
+                    fig3.add_scatter(x=forecast_df["Date"], y=forecast_df["Prophet_Forecast"], mode="lines", name="Prophet Only", line=dict(dash="dash"))
+                    st.plotly_chart(fig3, use_container_width=True)
+                    latest_val = forecast_df["Final_Forecast"].iloc[-1]
+                    mean_val = df_daily["Revenue"].mean()
+                    if latest_val < mean_val * 0.95:
+                        st.warning("Revenue may drop in the coming days. Consider offering discounts or promotions.")
+                    else:
+                        st.success("Revenue forecast is stable or increasing.")
             else:
-                preds = lstm_forecast(base_df, "Revenue", n_forecast=int(n_periods), n_steps=min(7, len(base_df)-1), freq="D", x_col="InvoiceDate")
-                pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
-                xaxis_label = "Date"
-            st.write(f"**Forecast (Day-wise for next {n_periods} days):**")
-        elif period == "Daily" and not df_hourly.empty and forecast_freq == "Weekly":
-            # Weekly forecast for selected day context
-            base_df = df[(df['InvoiceDate'].dt.date <= selected_date)].copy()
-            if base_df.empty:
-                st.warning("Not enough data for forecasting.")
-                return
-            base_df = base_df.set_index('InvoiceDate').resample('W').agg({
-                'Revenue': 'sum'
-            }).reset_index()
-            if forecast_type == "Linear Regression":
-                preds = linear_regression_forecast(base_df, "InvoiceDate", "Revenue", int(n_periods), freq="W")
-                pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
-                xaxis_label = "Date"
-            else:
-                preds = lstm_forecast(base_df, "Revenue", n_forecast=int(n_periods), n_steps=min(7, len(base_df)-1), freq="W", x_col="InvoiceDate")
-                pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
-                xaxis_label = "Date"
-            st.write(f"**Forecast (Week-wise for next {n_periods} weeks):**")
-        elif period == "Daily" and not df_hourly.empty and forecast_freq == "Monthly":
-            # Monthly forecast for selected day context
-            base_df = df[(df['InvoiceDate'].dt.date <= selected_date)].copy()
-            if base_df.empty:
-                st.warning("Not enough data for forecasting.")
-                return
-            base_df = base_df.set_index('InvoiceDate').resample('M').agg({
-                'Revenue': 'sum'
-            }).reset_index()
-            if forecast_type == "Linear Regression":
-                preds = linear_regression_forecast(base_df, "InvoiceDate", "Revenue", int(n_periods), freq="M")
-                pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
-                xaxis_label = "Date"
-            else:
-                preds = lstm_forecast(base_df, "Revenue", n_forecast=int(n_periods), n_steps=min(7, len(base_df)-1), freq="M", x_col="InvoiceDate")
-                pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
-                xaxis_label = "Date"
-            st.write(f"**Forecast (Month-wise for next {n_periods} months):**")
-        else:
-            # For Weekly, Monthly, Yearly, or Daily (future days)
-            base_df = df_res
-            if base_df.empty:
-                st.warning("Not enough data for forecasting.")
-                return
-            base_df = base_df.copy().sort_values("InvoiceDate")
-            if forecast_type == "Linear Regression":
-                preds = linear_regression_forecast(base_df, "InvoiceDate", "Revenue", int(n_periods), freq=freq_for_pred)
-                pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
-                xaxis_label = "Date"
-            else:
-                preds = lstm_forecast(base_df, "Revenue", n_forecast=int(n_periods), n_steps=min(7, len(base_df)-1), freq=freq_for_pred, x_col="InvoiceDate")
-                pred_df = pd.DataFrame(preds, columns=["Date", "Predicted Revenue"])
-                xaxis_label = "Date"
-            st.write(f"**Forecast ({forecast_freq}):**")
-        if preds:
-            st.dataframe(pred_df)
-            fig2 = px.line(pred_df, x=xaxis_label, y="Predicted Revenue", title="Revenue Forecast", markers=True)
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.warning("Not enough data for forecasting.")
+                st.info("Not enough daily data for forecast (minimum 30 days required).")
 
 def admin_password_reset_flow():
     st.subheader("Admin Password Reset")
